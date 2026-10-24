@@ -52,7 +52,7 @@ jobs:
             --availability-domain "${{ secrets.OCI_AD }}" \
             --compartment-id "${{ secrets.OCI_COMPARTMENT }}" \
             --shape VM.Standard.A1.Flex \
-            --shape-config '{"ocpus":4,"memoryInGBs":24}' \
+            --shape-config '{"ocpus":1,"memoryInGBs":6}' \
             --image-id "${{ secrets.OCI_IMAGE }}" \
             --subnet-id "${{ secrets.OCI_SUBNET }}" \
             --assign-public-ip true \
