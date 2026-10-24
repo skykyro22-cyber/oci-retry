@@ -59,6 +59,7 @@ jobs:
             --ssh-authorized-keys-file /tmp/key.pub \
             --display-name free-arm 2>&1); then
             echo "Launched!"
+            curl -s -d "Oracle server launched! Check Compute > Instances" ntfy.sh/kyro-oci-7x2qm9vt4k || true
             gh workflow disable oci-retry.yml
           elif echo "$out" | grep -qiE "out of host capacity|InternalError|too many requests"; then
             echo "No capacity, will retry next run"
