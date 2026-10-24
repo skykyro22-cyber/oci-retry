@@ -59,11 +59,15 @@ jobs:
             --ssh-authorized-keys-file /tmp/key.pub \
             --display-name free-arm 2>&1); then
             echo "Launched!"
-            curl -s -d "Oracle server launched! Check Compute > Instances" ntfy.sh/kyro-oci-7x2qm9vt4k || true
+            curl -s -H "Priority: urgent" -H "Title: OCI server launched" -d "Got it! Check Compute > Instances." ntfy.sh/kyro-oci-7x2qm9vt4k || true
             gh workflow disable oci-retry.yml
           elif echo "$out" | grep -qiE "out of host capacity|InternalError|too many requests"; then
             echo "No capacity, will retry next run"
+            if [ "$(date -u +%M)" -lt 10 ]; then
+              curl -s -H "Priority: min" -H "Title: OCI retry" -d "Still no capacity. Retrying every 5 min." ntfy.sh/kyro-oci-7x2qm9vt4k || true
+            fi
           else
             echo "$out"
+            curl -s -H "Priority: high" -H "Title: OCI retry ERROR" -d "A run failed with a real error. Check GitHub Actions." ntfy.sh/kyro-oci-7x2qm9vt4k || true
             exit 1
           fi
