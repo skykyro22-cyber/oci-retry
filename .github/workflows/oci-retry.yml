@@ -1,0 +1,68 @@
+name: oci-retry
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      OCI_KEY_PEM: ${{ secrets.OCI_KEY_PEM }}
+    steps:
+      - name: Install OCI CLI
+        run: pip install oci-cli
+
+      - name: Write OCI config
+        run: |
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_KEY_PEM" > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_USER }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY }}
+          region=${{ secrets.OCI_REGION }}
+          key_file=$HOME/.oci/key.pem
+          EOF
+
+      - name: Try to launch
+        run: |
+          existing=$(oci compute instance list \
+            --compartment-id "${{ secrets.OCI_COMPARTMENT }}" \
+            --display-name free-arm \
+            --query "data[?\"lifecycle-state\"!='TERMINATED'] | length(@)" \
+            --raw-output)
+          existing=${existing:-0}
+          if [ "$existing" != "0" ]; then
+            echo "Instance already exists, disabling workflow"
+            gh workflow disable oci-retry.yml
+            exit 0
+          fi
+
+          echo "${{ secrets.OCI_SSH_PUBKEY }}" > /tmp/key.pub
+
+          if out=$(oci compute instance launch \
+            --availability-domain "${{ secrets.OCI_AD }}" \
+            --compartment-id "${{ secrets.OCI_COMPARTMENT }}" \
+            --shape VM.Standard.A1.Flex \
+            --shape-config '{"ocpus":4,"memoryInGBs":24}' \
+            --image-id "${{ secrets.OCI_IMAGE }}" \
+            --subnet-id "${{ secrets.OCI_SUBNET }}" \
+            --assign-public-ip true \
+            --ssh-authorized-keys-file /tmp/key.pub \
+            --display-name free-arm 2>&1); then
+            echo "Launched!"
+            gh workflow disable oci-retry.yml
+          elif echo "$out" | grep -qiE "out of host capacity|InternalError|too many requests"; then
+            echo "No capacity, will retry next run"
+          else
+            echo "$out"
+            exit 1
+          fi
