@@ -1,7 +1,5 @@
 name: oci-retry
 on:
-  schedule:
-    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -14,6 +12,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       OCI_KEY_PEM: ${{ secrets.OCI_KEY_PEM }}
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
     steps:
       - name: Install OCI CLI
         run: pip install oci-cli
@@ -59,15 +58,15 @@ jobs:
             --ssh-authorized-keys-file /tmp/key.pub \
             --display-name free-arm 2>&1); then
             echo "Launched!"
-            curl -s -H "Priority: urgent" -H "Title: OCI server launched" -d "Got it! Check Compute > Instances." ntfy.sh/kyro-oci-7x2qm9vt4k || true
+            curl -s -H "Priority: urgent" -H "Title: OCI server launched" -d "Got it! Check Compute > Instances." "ntfy.sh/$NTFY_TOPIC" || true
             gh workflow disable oci-retry.yml
           elif echo "$out" | grep -qiE "out of host capacity|InternalError|too many requests"; then
             echo "No capacity, will retry next run"
-            if [ "$(date -u +%M)" -lt 10 ]; then
-              curl -s -H "Priority: min" -H "Title: OCI retry" -d "Still no capacity. Retrying every 5 min." ntfy.sh/kyro-oci-7x2qm9vt4k || true
+            if [ "$(date -u +%M)" -lt 5 ]; then
+              curl -s -H "Priority: min" -H "Title: OCI retry" -d "Still no capacity. Retrying every 5 min." "ntfy.sh/$NTFY_TOPIC" || true
             fi
           else
             echo "$out"
-            curl -s -H "Priority: high" -H "Title: OCI retry ERROR" -d "A run failed with a real error. Check GitHub Actions." ntfy.sh/kyro-oci-7x2qm9vt4k || true
+            curl -s -H "Priority: high" -H "Title: OCI retry ERROR" -d "A run failed with a real error. Check GitHub Actions." "ntfy.sh/$NTFY_TOPIC" || true
             exit 1
           fi
