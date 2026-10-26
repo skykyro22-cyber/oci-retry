@@ -61,6 +61,7 @@ jobs:
             curl -s -H "Priority: urgent" -H "Title: OCI server launched" -d "Got it! Check Compute > Instances." "ntfy.sh/$NTFY_TOPIC" || true
             gh workflow disable oci-retry.yml
           elif echo "$out" | grep -qiE "out of host capacity|InternalError|too many requests"; then
+            echo "$out" | grep -iE '"(code|message)"' || true
             echo "No capacity, will retry next run"
             if [ "$(date -u +%M)" -lt 5 ]; then
               curl -s -H "Priority: min" -H "Title: OCI retry" -d "Still no capacity. Retrying every 5 min." "ntfy.sh/$NTFY_TOPIC" || true
