@@ -131,7 +131,7 @@ jobs:
 
           # After a win: wait for the public ip, then send it with a ready-to-paste ssh command
           report_ip() {
-            local id=$1 ip="" os user i
+            local id=$1 ip="" os user i msg
             for i in $(seq 1 15); do
               ip=$(oci compute instance list-vnics --instance-id "$id" \
                      --query 'data[0]."public-ip"' --raw-output --no-retry 2>/dev/null || true)
@@ -148,12 +148,9 @@ jobs:
               *Ubuntu*) user=ubuntu ;;
               *) user=opc ;;
             esac
-            notify urgent "$(pick "your server's ip" "ip is in" "here's the ip")" \
-              "$(pick "ip is $ip" "it's at $ip" "server ip: $ip")
-connect with:
-ssh -i <path to your private key> $user@$ip
-(default user is ubuntu on ubuntu images, opc on oracle linux)" \
-              "computer"
+            msg=$(printf '%s\nconnect with:\nssh -i <path to your private key> %s@%s\n(default user is ubuntu on ubuntu images, opc on oracle linux)' \
+              "$(pick "ip is $ip" "it's at $ip" "server ip: $ip")" "$user" "$ip")
+            notify urgent "$(pick "your server's ip" "ip is in" "here's the ip")" "$msg" "computer"
           }
 
           # Seconds left in this run's budget
