@@ -73,13 +73,238 @@ jobs:
 
           # One-line progress report: how many runs so far and how long the hunt has lasted
           hunt_summary() {
-            local total first secs
+            local total first first_ts secs
             total=$(gh api "repos/$GH_REPO/actions/workflows/oci-retry.yml/runs?per_page=1" --jq .total_count 2>/dev/null) || total=""
             first=""
             if [ "${total:-0}" -gt 0 ] 2>/dev/null; then
               first=$(gh api "repos/$GH_REPO/actions/workflows/oci-retry.yml/runs?per_page=1&page=$total" --jq '.workflow_runs[0].created_at' 2>/dev/null) || first=""
             fi
-            case "$first" in
-              20*)
-                secs=$(( $(date -u +%s) - $(date -u -d "$first" +%s) ))
-                echo
+            if [ -n "$first" ] && first_ts=$(date -u -d "$first" +%s 2>/dev/null); then
+              secs=$(( $(date -u +%s) - first_ts ))
+              echo "that's $total runs over $(( secs / 86400 ))d $(( (secs % 86400) / 3600 ))h so far."
+            else
+              echo "this was run #$GITHUB_RUN_NUMBER."
+            fi
+          }
+
+          # Did the last few finished runs get throttled? One word per run, newest first (yes/no).
+          # A run counts as throttled if its "Mark throttled run" step ran (it is skipped otherwise).
+          recent_flags() {
+            local id s n=0
+            for id in $(gh run list --workflow oci-retry.yml --limit 12 --json databaseId,status \
+                  --jq ".[] | select(.status==\"completed\" and .databaseId!=$GITHUB_RUN_ID) | .databaseId" 2>/dev/null); do
+              [ "$n" -ge "$THROTTLE_STREAK" ] && break
+              s=$(gh api "repos/$GH_REPO/actions/runs/$id/jobs" \
+                    --jq '[.jobs[].steps[]? | select(.name=="Mark throttled run") | .conclusion] | first // "none"' 2>/dev/null) || s="none"
+              if [ "$s" = "success" ]; then echo yes; else echo no; fi
+              n=$((n + 1))
+            done
+          }
+
+          # $1 = yes if this run was throttled, no if not. Sends one heads-up when a
+          # streak reaches THROTTLE_STREAK runs, and one "all good" when it ends.
+          streak_check() {
+            [ "$THROTTLE_STREAK" -gt 0 ] || return 0
+            local lead=0 f
+            for f in $(recent_flags); do
+              if [ "$f" = yes ]; then lead=$((lead + 1)); else break; fi
+            done
+            if [ "$1" = yes ] && [ "$lead" -eq $((THROTTLE_STREAK - 1)) ]; then
+              notify default \
+                "$(pick "oracle's throttling us" "slow-down streak" "oracle says chill")" \
+                "$(pick \
+                  "$THROTTLE_STREAK runs in a row got the slow-down answer. script's backing off on its own, nothing for you to do." \
+                  "oracle keeps telling us to chill ($THROTTLE_STREAK runs straight). it's handling it by itself, just a heads up." \
+                  "throttled $THROTTLE_STREAK runs in a row bro. backing off automatically, you're good.")" \
+                "warning"
+            elif [ "$1" = no ] && [ "$lead" -ge "$THROTTLE_STREAK" ]; then
+              notify low \
+                "$(pick "back to normal" "oracle chilled out" "throttling's over")" \
+                "$(pick \
+                  "ok oracle stopped throttling, tries are going through again." \
+                  "throttle streak is over. back to normal tries." \
+                  "oracle finally chilled out. back to the usual.")" \
+                "white_check_mark"
+            fi
+          }
+
+          # Seconds left in this run's budget
+          time_left() { echo $(( RUN_BUDGET_SECS - ( $(date -u +%s) - START_TS ) )); }
+
+          # Sleep up to $1 seconds (plus a little random jitter), never past the budget
+          nap() {
+            local want=$(( $1 + RANDOM % 16 )) left
+            left=$(time_left)
+            [ "$want" -gt "$left" ] && want=$left
+            if [ "$want" -gt 0 ]; then echo "Waiting ${want}s"; sleep "$want"; fi
+          }
+
+          # Sort an OCI error into: capacity / throttled / transient / error
+          classify() {
+            t=$(echo "$1" | tr 'A-Z' 'a-z')
+            case "$t" in
+              *"out of host capacity"*) echo capacity ;;
+              *toomanyrequests*|*"too many requests"*|*'"status": 429'*|*"status: 429"*) echo throttled ;;
+              *internalerror*|*"timed out"*|*connection*|*serviceunavailable*|*"bad gateway"*|*"gateway timeout"*) echo transient ;;
+              *) echo error ;;
+            esac
+          }
+
+          # 1. Deadline: stop on our own so this can't run for months
+          if [ "$(date -u +%s)" -ge "$(date -u -d "$DEADLINE" +%s)" ]; then
+            echo "Deadline $DEADLINE passed, stopping"
+            notify default "hunt over" \
+              "that's the deadline ($DEADLINE) and still no server. turned the workflow off. $(hunt_summary)" "stopwatch"
+            stop_workflow
+            exit 0
+          fi
+
+          hour=$(date -u +%H); min=$(date -u +%M)
+          heartbeat=false
+          if [ $((10#$hour % HEARTBEAT_HOURS)) -eq 0 ] && [ "$min" -lt 5 ]; then heartbeat=true; fi
+
+          # 2. Already have the instance? Only checked once an hour to save API calls
+          if [ "$min" -lt 5 ]; then
+            if ! existing=$(oci compute instance list \
+                --compartment-id "${{ secrets.OCI_COMPARTMENT }}" \
+                --display-name free-arm \
+                --query "data[?\"lifecycle-state\"!='TERMINATED'] | length(@)" \
+                --raw-output --no-retry 2>/tmp/list.err); then
+              echo "Instance check failed, skipping this run:"
+              tail -n 5 /tmp/list.err
+              if grep -qiE "notauthenticated|notauthorized" /tmp/list.err; then
+                notify high "login broke" "oracle login failed. workflow's off. check your api key secrets." "rotating_light"
+                stop_workflow
+                exit 1
+              fi
+              if grep -qiE "toomanyrequests|too many requests|\"status\": 429" /tmp/list.err; then
+                echo "Throttled on the instance check, cooling down"
+                echo "throttled=yes" >> "$GITHUB_OUTPUT"
+                nap "$BACKOFF_START"
+              fi
+              exit 0
+            fi
+            existing=${existing:-0}
+            if [ "$existing" != "0" ]; then
+              echo "Instance already exists, disabling workflow"
+              notify default "already got one" \
+                "free-arm already exists bro, so the workflow turned itself off. go look in compute > instances." "white_check_mark"
+              stop_workflow
+              exit 0
+            fi
+          fi
+
+          echo "${{ secrets.OCI_SSH_PUBKEY }}" > /tmp/key.pub
+
+          # 3. A few well-spaced tries, one request each (no hidden CLI retries).
+          # "Too many requests" is handled here: wait with a growing pause and keep going.
+          # It never stops the workflow and does not use up one of the ATTEMPTS.
+          no_cap=0
+          throttled=0
+          tries=0
+          backoff=$BACKOFF_START
+          while [ "$tries" -lt "$ATTEMPTS" ] && [ "$(time_left)" -gt 30 ]; do
+            if out=$(oci compute instance launch \
+              --availability-domain "${{ secrets.OCI_AD }}" \
+              --compartment-id "${{ secrets.OCI_COMPARTMENT }}" \
+              --shape VM.Standard.A1.Flex \
+              --shape-config '{"ocpus":1,"memoryInGBs":6}' \
+              --image-id "${{ secrets.OCI_IMAGE }}" \
+              --subnet-id "${{ secrets.OCI_SUBNET }}" \
+              --assign-public-ip true \
+              --ssh-authorized-keys-file /tmp/key.pub \
+              --display-name free-arm \
+              --no-retry 2>&1); then
+              echo "Launched!"
+              inst_json=$(echo "$out" | sed -n '/^{/,$p')
+              inst_name=$(echo "$inst_json" | jq -r '.data."display-name" // "free-arm"' 2>/dev/null || echo free-arm)
+              inst_state=$(echo "$inst_json" | jq -r '.data."lifecycle-state" // "PROVISIONING"' 2>/dev/null || echo PROVISIONING)
+              notify urgent "$(pick "WE GOT ONE" "server launched!!" "it landed" "FINALLY")" \
+                "$(pick \
+                  "GOT IT bro!! oracle finally caved." \
+                  "we caught one!! lets gooo." \
+                  "it landed!! the server's real." \
+                  "FINALLY. oracle gave us a server.") $inst_name is $inst_state right now. $(hunt_summary) check compute > instances for the ip in a minute. workflow's off so it won't grab a second one." \
+                "tada,rocket"
+              stop_workflow
+              exit 0
+            fi
+
+            kind=$(classify "$out")
+            echo "Try $((tries + 1))/$ATTEMPTS: $kind"
+            case "$kind" in
+              capacity)
+                no_cap=$((no_cap + 1))
+                tries=$((tries + 1))
+                backoff=$BACKOFF_START
+                if [ "$tries" -lt "$ATTEMPTS" ]; then nap "$GAP_SECS"; fi
+                ;;
+              throttled)
+                throttled=$((throttled + 1))
+                echo "Oracle asked us to slow down. Backing off ${backoff}s, then trying again."
+                nap "$backoff"
+                backoff=$(( backoff * 2 ))
+                [ "$backoff" -gt "$BACKOFF_MAX" ] && backoff=$BACKOFF_MAX
+                ;;
+              transient)
+                echo "Network or server hiccup, trying again next run"
+                echo "$out" | tail -n 5
+                break
+                ;;
+              *)
+                echo "$out"
+                notify high "something broke" "a run hit a real error. workflow's off. tap this to open the log." "rotating_light"
+                stop_workflow
+                exit 1
+                ;;
+            esac
+          done
+
+          # Remember (for the next runs) whether this one was throttled, and send the streak heads-up if due
+          if [ "$throttled" -gt 0 ]; then
+            echo "throttled=yes" >> "$GITHUB_OUTPUT"
+            streak_check yes
+            echo "Finished a throttled run, final cooldown"
+            nap "$BACKOFF_START"
+          else
+            streak_check no
+          fi
+
+          echo "No server this run (no capacity: $no_cap, throttled: $throttled), will retry next ping"
+          if [ "$heartbeat" = true ]; then
+            days_left=$(( ( $(date -u -d "$DEADLINE" +%s) - $(date -u +%s) ) / 86400 ))
+            notify low \
+              "$(pick "still hunting" "server hunt" "nothing yet" "oracle watch" "still nothing")" \
+              "$(pick \
+                "still no capacity. script's still knocking on oracle's door." \
+                "no server yet. oracle's shelves are empty lol." \
+                "zurich has nothing free rn. still trying." \
+                "no dice so far. still grinding in the background." \
+                "capacity: zero. persistence: maximum." \
+                "still waiting on a free slot, nothing for you to do bro." \
+                "no server yet but the script ain't giving up." \
+                "another day, another empty datacenter. still at it.") last run: $no_cap no-capacity, $throttled throttled. $(hunt_summary) $days_left days left till the deadline." \
+              "hourglass_flowing_sand"
+          elif [ "$MILESTONE_RUNS" -gt 0 ] && [ $(( GITHUB_RUN_NUMBER % MILESTONE_RUNS )) -eq 0 ]; then
+            days_left=$(( ( $(date -u -d "$DEADLINE" +%s) - $(date -u +%s) ) / 86400 ))
+            notify low "run #$GITHUB_RUN_NUMBER" \
+              "$(pick \
+                "hit run #$GITHUB_RUN_NUMBER and still no server lol." \
+                "run #$GITHUB_RUN_NUMBER done. oracle's still being stingy." \
+                "milestone: run #$GITHUB_RUN_NUMBER. no server yet but we're not stopping.") $(hunt_summary) $days_left days left till the deadline." \
+              "chart_with_upwards_trend"
+          fi
+
+      - name: Mark throttled run
+        if: ${{ steps.launch.outputs.throttled == 'yes' }}
+        run: echo "Oracle throttled this run. This step only runs so later runs can tell (it shows as skipped otherwise)."
+
+      - name: Alert if setup failed
+        if: ${{ failure() && steps.launch.outcome != 'failure' }}
+        run: |
+          # The launch step sends its own alerts. This one covers failures before it
+          # (tool install, config), at most about every 30 minutes so it can't spam.
+          m=$(date -u +%M)
+          if [ "$m" -lt 5 ] || { [ "$m" -ge 30 ] && [ "$m" -lt 35 ]; }; then
+            curl -s -H "Priority: high" -H "Title: setup broke" -H "Tags: rotating_light" -H "Click: $RUN_URL" -d "setup crashed before the launch even started (tool install or config). tap this to see the log." "ntfy.sh/$NTFY_TOPIC" || true
+          fi
