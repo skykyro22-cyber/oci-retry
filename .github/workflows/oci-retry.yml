@@ -47,6 +47,7 @@ jobs:
 
           echo "${{ secrets.OCI_SSH_PUBKEY }}" > /tmp/key.pub
 
+          # DEBUG: --debug is temporary. Remove it after 1-2 runs.
           if out=$(oci compute instance launch \
             --availability-domain "${{ secrets.OCI_AD }}" \
             --compartment-id "${{ secrets.OCI_COMPARTMENT }}" \
@@ -56,18 +57,23 @@ jobs:
             --subnet-id "${{ secrets.OCI_SUBNET }}" \
             --assign-public-ip true \
             --ssh-authorized-keys-file /tmp/key.pub \
-            --display-name free-arm 2>&1); then
+            --display-name free-arm \
+            --debug 2>&1); then
             echo "Launched!"
             curl -s -H "Priority: urgent" -H "Title: OCI server launched" -d "Got it! Check Compute > Instances." "ntfy.sh/$NTFY_TOPIC" || true
             gh workflow disable oci-retry.yml
           elif echo "$out" | grep -qiE "out of host capacity|InternalError|too many requests"; then
             echo "$out" | grep -iE '"(code|message)"' || true
+            echo "--- error tally for this run ---"
+            echo "$out" | grep -ioE 'TooManyRequests|too many requests|out of host capacity|InternalError' | tr 'A-Z' 'a-z' | sort | uniq -c
+            echo "--- retry/status lines ---"
+            echo "$out" | grep -iE 'retry|attempt|status' | head -40 || true
             echo "No capacity, will retry next run"
             if [ "$(date -u +%M)" -lt 5 ]; then
               curl -s -H "Priority: min" -H "Title: OCI retry" -d "Still no capacity. Retrying every 5 min." "ntfy.sh/$NTFY_TOPIC" || true
             fi
           else
-            echo "$out"
+            echo "$out" | tail -n 60
             curl -s -H "Priority: high" -H "Title: OCI retry ERROR" -d "A run failed with a real error. Check GitHub Actions." "ntfy.sh/$NTFY_TOPIC" || true
             exit 1
           fi
