@@ -5,14 +5,23 @@ on:
 permissions:
   actions: write
 
+# Never let two runs overlap (cron pings every 5 min, a run takes ~3-4 min)
+concurrency:
+  group: oci-retry
+  cancel-in-progress: false
+
 jobs:
   launch:
     runs-on: ubuntu-latest
+    timeout-minutes: 8
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       OCI_KEY_PEM: ${{ secrets.OCI_KEY_PEM }}
       NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      DEADLINE: "2026-11-10"   # UTC date; the workflow disables itself after this
+      ATTEMPTS: "3"            # launch tries per run
+      GAP_SECS: "100"          # pause between tries; keep this at 60 or more
     steps:
       - name: Install OCI CLI
         run: pip install oci-cli
@@ -30,50 +39,125 @@ jobs:
           region=${{ secrets.OCI_REGION }}
           key_file=$HOME/.oci/key.pem
           EOF
+          chmod 600 ~/.oci/config
 
       - name: Try to launch
         run: |
-          existing=$(oci compute instance list \
-            --compartment-id "${{ secrets.OCI_COMPARTMENT }}" \
-            --display-name free-arm \
-            --query "data[?\"lifecycle-state\"!='TERMINATED'] | length(@)" \
-            --raw-output)
-          existing=${existing:-0}
-          if [ "$existing" != "0" ]; then
-            echo "Instance already exists, disabling workflow"
-            gh workflow disable oci-retry.yml
+          notify() { curl -s -H "Priority: $1" -H "Title: $2" -d "$3" "ntfy.sh/$NTFY_TOPIC" || true; }
+          stop_workflow() { gh workflow disable oci-retry.yml || true; }
+          # Pick one random item from the list (keeps the pings from getting repetitive)
+          pick() { local a=("$@"); echo "${a[RANDOM % ${#a[@]}]}"; }
+
+          # Sort an OCI error into: capacity / throttled / transient / error
+          classify() {
+            t=$(echo "$1" | tr 'A-Z' 'a-z')
+            case "$t" in
+              *"out of host capacity"*) echo capacity ;;
+              *toomanyrequests*|*"too many requests"*) echo throttled ;;
+              *internalerror*|*"timed out"*|*connection*|*serviceunavailable*|*"bad gateway"*|*"gateway timeout"*) echo transient ;;
+              *) echo error ;;
+            esac
+          }
+
+          # 1. Deadline: stop on our own so this can't run for months
+          if [ "$(date -u +%s)" -ge "$(date -u -d "$DEADLINE" +%s)" ]; then
+            echo "Deadline $DEADLINE passed, stopping"
+            notify default "OCI retry stopped" "Deadline $DEADLINE reached with no server. Workflow disabled."
+            stop_workflow
             exit 0
+          fi
+
+          hour=$(date -u +%H); min=$(date -u +%M)
+          heartbeat=false
+          if [ "$hour" = "06" ] && [ "$min" -lt 5 ]; then heartbeat=true; fi
+
+          # 2. Already have the instance? Only checked once an hour to save API calls
+          if [ "$min" -lt 5 ]; then
+            if ! existing=$(oci compute instance list \
+                --compartment-id "${{ secrets.OCI_COMPARTMENT }}" \
+                --display-name free-arm \
+                --query "data[?\"lifecycle-state\"!='TERMINATED'] | length(@)" \
+                --raw-output --no-retry 2>/tmp/list.err); then
+              echo "Instance check failed, skipping this run:"
+              tail -n 5 /tmp/list.err
+              if grep -qiE "notauthenticated|notauthorized" /tmp/list.err; then
+                notify high "OCI retry ERROR" "Oracle login failed. Workflow disabled. Check your API key secrets."
+                stop_workflow
+                exit 1
+              fi
+              exit 0
+            fi
+            existing=${existing:-0}
+            if [ "$existing" != "0" ]; then
+              echo "Instance already exists, disabling workflow"
+              stop_workflow
+              exit 0
+            fi
           fi
 
           echo "${{ secrets.OCI_SSH_PUBKEY }}" > /tmp/key.pub
 
-          # DEBUG: --debug is temporary. Remove it after 1-2 runs.
-          if out=$(oci compute instance launch \
-            --availability-domain "${{ secrets.OCI_AD }}" \
-            --compartment-id "${{ secrets.OCI_COMPARTMENT }}" \
-            --shape VM.Standard.A1.Flex \
-            --shape-config '{"ocpus":1,"memoryInGBs":6}' \
-            --image-id "${{ secrets.OCI_IMAGE }}" \
-            --subnet-id "${{ secrets.OCI_SUBNET }}" \
-            --assign-public-ip true \
-            --ssh-authorized-keys-file /tmp/key.pub \
-            --display-name free-arm \
-            --debug 2>&1); then
-            echo "Launched!"
-            curl -s -H "Priority: urgent" -H "Title: OCI server launched" -d "Got it! Check Compute > Instances." "ntfy.sh/$NTFY_TOPIC" || true
-            gh workflow disable oci-retry.yml
-          elif echo "$out" | grep -qiE "out of host capacity|InternalError|too many requests"; then
-            echo "$out" | grep -iE '"(code|message)"' || true
-            echo "--- error tally for this run ---"
-            echo "$out" | grep -ioE 'TooManyRequests|too many requests|out of host capacity|InternalError' | tr 'A-Z' 'a-z' | sort | uniq -c
-            echo "--- retry/status lines ---"
-            echo "$out" | grep -iE 'retry|attempt|status' | head -40 || true
-            echo "No capacity, will retry next run"
-            if [ "$(date -u +%M)" -lt 5 ]; then
-              curl -s -H "Priority: min" -H "Title: OCI retry" -d "Still no capacity. Retrying every 5 min." "ntfy.sh/$NTFY_TOPIC" || true
+          # 3. A few well-spaced tries, one request each (no hidden CLI retries)
+          for i in $(seq 1 "$ATTEMPTS"); do
+            if out=$(oci compute instance launch \
+              --availability-domain "${{ secrets.OCI_AD }}" \
+              --compartment-id "${{ secrets.OCI_COMPARTMENT }}" \
+              --shape VM.Standard.A1.Flex \
+              --shape-config '{"ocpus":1,"memoryInGBs":6}' \
+              --image-id "${{ secrets.OCI_IMAGE }}" \
+              --subnet-id "${{ secrets.OCI_SUBNET }}" \
+              --assign-public-ip true \
+              --ssh-authorized-keys-file /tmp/key.pub \
+              --display-name free-arm \
+              --no-retry 2>&1); then
+              echo "Launched!"
+              notify urgent "OCI server launched" "$(pick \
+                "Got it! Check Compute > Instances." \
+                "We caught one! Open Compute > Instances." \
+                "It landed. Your server is in Compute > Instances." \
+                "Finally. Go look in Compute > Instances.")"
+              stop_workflow
+              exit 0
             fi
-          else
-            echo "$out" | tail -n 60
-            curl -s -H "Priority: high" -H "Title: OCI retry ERROR" -d "A run failed with a real error. Check GitHub Actions." "ntfy.sh/$NTFY_TOPIC" || true
-            exit 1
+
+            kind=$(classify "$out")
+            echo "Attempt $i/$ATTEMPTS: $kind"
+            case "$kind" in
+              capacity)
+                ;;
+              throttled)
+                echo "Oracle is throttling us. Stopping to protect the account."
+                notify high "OCI throttled" "Oracle said too many requests. Workflow disabled. Re-enable it later by hand."
+                stop_workflow
+                exit 0
+                ;;
+              transient)
+                echo "Network or server hiccup, trying again next run"
+                echo "$out" | tail -n 5
+                break
+                ;;
+              *)
+                echo "$out"
+                notify high "OCI retry ERROR" "A run failed with a real error. Workflow disabled. Check GitHub Actions."
+                stop_workflow
+                exit 1
+                ;;
+            esac
+
+            if [ "$i" -lt "$ATTEMPTS" ]; then sleep "$GAP_SECS"; fi
+          done
+
+          echo "No capacity this run, will retry next ping"
+          if [ "$heartbeat" = true ]; then
+            notify min \
+              "$(pick "OCI retry" "Server hunt" "Oracle watch" "Still hunting" "Nothing yet")" \
+              "$(pick \
+                "Still no capacity. The script is still knocking." \
+                "No server yet. Oracle's shelves are empty." \
+                "Zurich has nothing free right now. Still trying." \
+                "No dice so far. Still going in the background." \
+                "Capacity: zero. Persistence: maximum." \
+                "Still waiting on a free slot. Nothing for you to do." \
+                "No server yet, but the script hasn't given up." \
+                "Another day, another empty datacenter. Still trying.")"
           fi
