@@ -292,6 +292,8 @@ jobs:
               throttled)
                 throttled=$((throttled + 1))
                 echo "Oracle asked us to slow down. Backing off ${backoff}s, then trying again."
+                echo "--- raw oracle response ---"
+                echo "$out" | tail -n 8
                 if [ "$throttled" -eq 1 ]; then
                   notify default \
                     "$(pick "oracle throttled us" "slow-down from oracle" "rate limited" "oracle says chill")" \
