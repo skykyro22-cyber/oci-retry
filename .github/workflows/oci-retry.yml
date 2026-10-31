@@ -21,7 +21,7 @@ jobs:
       GH_REPO: ${{ github.repository }}
       OCI_KEY_PEM: ${{ secrets.OCI_KEY_PEM }}
       NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-      DEADLINE: "2026-11-10"   # UTC date; the workflow disables itself after this
+      DEADLINE: "2027-12-31"   # UTC date; the workflow disables itself after this
       ATTEMPTS: "2"            # real launch tries per run (capacity answers only)
       GAP_SECS: "150"          # pause between tries; keep this at 60 or more
       BACKOFF_START: "120"     # first wait after a "too many requests" answer
@@ -29,7 +29,6 @@ jobs:
       RUN_BUDGET_SECS: "540"   # a run never works or waits longer than this
       HEARTBEAT_HOURS: "2"     # "all is well" ping every N hours (1 = hourly, 24 = daily)
       MILESTONE_RUNS: "100"    # extra progress ping every N runs (0 = off)
-      THROTTLE_STREAK: "3"     # heads-up when Oracle throttles this many runs in a row (0 = off)
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - name: Install OCI CLI
@@ -73,59 +72,102 @@ jobs:
 
           # One-line progress report: how many runs so far and how long the hunt has lasted
           hunt_summary() {
-            local total first first_ts secs
+            local total first secs
             total=$(gh api "repos/$GH_REPO/actions/workflows/oci-retry.yml/runs?per_page=1" --jq .total_count 2>/dev/null) || total=""
             first=""
             if [ "${total:-0}" -gt 0 ] 2>/dev/null; then
               first=$(gh api "repos/$GH_REPO/actions/workflows/oci-retry.yml/runs?per_page=1&page=$total" --jq '.workflow_runs[0].created_at' 2>/dev/null) || first=""
             fi
-            if [ -n "$first" ] && first_ts=$(date -u -d "$first" +%s 2>/dev/null); then
-              secs=$(( $(date -u +%s) - first_ts ))
-              echo "that's $total runs over $(( secs / 86400 ))d $(( (secs % 86400) / 3600 ))h so far."
-            else
-              echo "this was run #$GITHUB_RUN_NUMBER."
-            fi
+            case "$first" in
+              20*)
+                secs=$(( $(date -u +%s) - $(date -u -d "$first" +%s) ))
+                echo "that's $total runs over $(( secs / 86400 ))d $(( (secs % 86400) / 3600 ))h so far."
+                ;;
+              *) echo "this was run #$GITHUB_RUN_NUMBER." ;;
+            esac
           }
 
-          # Did the last few finished runs get throttled? One word per run, newest first (yes/no).
-          # A run counts as throttled if its "Mark throttled run" step ran (it is skipped otherwise).
-          recent_flags() {
-            local id s n=0
-            for id in $(gh run list --workflow oci-retry.yml --limit 12 --json databaseId,status \
-                  --jq ".[] | select(.status==\"completed\" and .databaseId!=$GITHUB_RUN_ID) | .databaseId" 2>/dev/null); do
-              [ "$n" -ge "$THROTTLE_STREAK" ] && break
+          # Heartbeat line: current throttle rate = how many of the real runs in the last
+          # HEARTBEAT_HOURS hours got throttled (cancelled/replaced pings are ignored).
+          window_summary() {
+            local since total=0 thr=0 id s pct
+            since=$(date -u -d "$HEARTBEAT_HOURS hours ago" +%Y-%m-%dT%H:%M:%SZ)
+            for id in $(gh run list --workflow oci-retry.yml --created ">=$since" --limit 60 --json databaseId,status,conclusion \
+                  --jq ".[] | select(.status==\"completed\" and .conclusion!=\"cancelled\" and .conclusion!=\"skipped\" and .databaseId!=$GITHUB_RUN_ID) | .databaseId" 2>/dev/null); do
+              total=$((total + 1))
               s=$(gh api "repos/$GH_REPO/actions/runs/$id/jobs" \
                     --jq '[.jobs[].steps[]? | select(.name=="Mark throttled run") | .conclusion] | first // "none"' 2>/dev/null) || s="none"
-              if [ "$s" = "success" ]; then echo yes; else echo no; fi
-              n=$((n + 1))
+              if [ "$s" = "success" ]; then thr=$((thr + 1)); fi
             done
+            total=$((total + 1))                                   # this run
+            if [ "$throttled" -gt 0 ]; then thr=$((thr + 1)); fi   # this run, if it was throttled
+            pct=$(( thr * 100 / total ))
+            echo "throttle rate, last ${HEARTBEAT_HOURS}h: $thr of $total runs ($pct%)."
           }
 
-          # $1 = yes if this run was throttled, no if not. Sends one heads-up when a
-          # streak reaches THROTTLE_STREAK runs, and one "all good" when it ends.
-          streak_check() {
-            [ "$THROTTLE_STREAK" -gt 0 ] || return 0
-            local lead=0 f
-            for f in $(recent_flags); do
-              if [ "$f" = yes ]; then lead=$((lead + 1)); else break; fi
+          # Manga recs for the heartbeat. Picked for: fast hooks, little fanservice, no bloat, not grimdark.
+          # It walks the list in order (changes every heartbeat) so nothing repeats until the whole list is used.
+          manga_rec() {
+            local recs=(
+              "Blade of the Immortal - an immortal samurai guards a girl out for revenge. 30 volumes of brutal duels and gorgeous linework."
+              "Claymore - half-human swordswomen hunt shapeshifting monsters. 27 volumes of dark fantasy done right."
+              "Dorohedoro - a man with a lizard head hunts for his past in a sorcerer-infested hellscape. weird and violent in a fun way, 23 volumes."
+              "Slam Dunk - Takehiko Inoue, the Vagabond author, on basketball. 31 volumes and one of the best sports manga ever."
+              "Real - Inoue again: wheelchair basketball and rebuilding lives, no fantasy. it hits as hard as Vagabond in its own way."
+              "Monster - a surgeon hunts the patient he saved. 18-volume thriller, a good pick if you liked Death Note."
+              "Pluto - Urasawa's robot murder mystery, 8 volumes. tight sci-fi detective story."
+              "Bakuman - the Death Note team's story about two teens trying to make it as manga artists. 20 volumes."
+              "Look Back - Fujimoto's one-volume story about two girls who draw manga. short and it hits hard."
+              "Sakamoto Days - a retired legendary hitman runs a corner store. fast, funny, creative fights."
+              "Kaiju No. 8 - a 32-year-old cleanup worker turns into a kaiju. fast action hook."
+              "Yu Yu Hakusho - Togashi's classic before Hunter x Hunter, 19 volumes. fast and no bloat."
+              "Rurouni Kenshin - a wandering swordsman who vowed never to kill. 28 volumes, if you liked Vagabond's swordplay."
+              "Ushio and Tora - a boy and a monster team up. classic shonen, 33 volumes, no filler."
+              "Gachiakuta - a boy thrown into a trash pit fights with weapons made from discarded things. fast hook, very stylish."
+              "One Punch Man - a hero who wins every fight in one hit. Murata's art is ridiculous."
+              "Mashle: Magic and Muscles - no magic, just absurd muscles, in a magic school. pure comedy-action."
+              "Dr. Stone - rebuilding civilization from the stone age with science. complete, fast hooks."
+              "Haikyuu!! - volleyball hyped like a battle shonen. complete, zero fanservice."
+              "Witch Hat Atelier - a girl learns a magic system built on drawing spells. clever and beautiful."
+              "The Apothecary Diaries - a young apothecary solves mysteries inside an imperial palace. sharp and low fanservice."
+              "Spy x Family - a spy, an assassin and a telepath fake being a family. comedy with real heart."
+              "Uncle from Another World - a man wakes from a 17-year coma after being isekai'd the whole time. comedy, low fanservice."
+              "The Devil Is a Part-Timer! - the Demon Lord works a fast-food job in Tokyo. comedy isekai, low fanservice."
+              "Restaurant to Another World - a restaurant door opens into a fantasy world. if you liked the food in Dungeon Meshi."
+              "How a Realist Hero Rebuilt the Kingdom - an isekai hero fixes a kingdom with politics and economics instead of power-ups."
+              "Eleceed - a kind-hearted teen trains under a powerful man trapped in a cat's body. fast fights, great humor."
+              "Return of the Mount Hua Sect - a legendary sword master wakes up a century later in a kid's body. fun martial arts regression."
+              "Tower of God - a boy climbs a tower to chase the girl who left him. big worldbuilding, ongoing."
+              "Trash of the Count's Family - a reader wakes up as a doomed side character in the novel he read. knows the plot, wants a quiet life."
+            )
+            echo "manga rec: ${recs[$(( $(date -u +%s) / 3600 / HEARTBEAT_HOURS % ${#recs[@]} ))]}"
+          }
+
+          # After a win: wait for the public ip, then send it with a ready-to-paste ssh command
+          report_ip() {
+            local id=$1 ip="" os user i
+            for i in $(seq 1 15); do
+              ip=$(oci compute instance list-vnics --instance-id "$id" \
+                     --query 'data[0]."public-ip"' --raw-output --no-retry 2>/dev/null || true)
+              case "$ip" in ""|null|None) ip="" ;; *) break ;; esac
+              sleep 20
             done
-            if [ "$1" = yes ] && [ "$lead" -eq $((THROTTLE_STREAK - 1)) ]; then
-              notify default \
-                "$(pick "oracle's throttling us" "slow-down streak" "oracle says chill")" \
-                "$(pick \
-                  "$THROTTLE_STREAK runs in a row got the slow-down answer. script's backing off on its own, nothing for you to do." \
-                  "oracle keeps telling us to chill ($THROTTLE_STREAK runs straight). it's handling it by itself, just a heads up." \
-                  "throttled $THROTTLE_STREAK runs in a row bro. backing off automatically, you're good.")" \
-                "warning"
-            elif [ "$1" = no ] && [ "$lead" -ge "$THROTTLE_STREAK" ]; then
-              notify low \
-                "$(pick "back to normal" "oracle chilled out" "throttling's over")" \
-                "$(pick \
-                  "ok oracle stopped throttling, tries are going through again." \
-                  "throttle streak is over. back to normal tries." \
-                  "oracle finally chilled out. back to the usual.")" \
-                "white_check_mark"
+            if [ -z "$ip" ]; then
+              notify high "server's up, no ip yet" "oracle hasn't shown a public ip yet. give it a few min and check compute > instances." "hourglass_flowing_sand"
+              return 0
             fi
+            os=$(oci compute image get --image-id "${{ secrets.OCI_IMAGE }}" \
+                   --query 'data."operating-system"' --raw-output --no-retry 2>/dev/null || true)
+            case "$os" in
+              *Ubuntu*) user=ubuntu ;;
+              *) user=opc ;;
+            esac
+            notify urgent "$(pick "your server's ip" "ip is in" "here's the ip")" \
+              "$(pick "ip is $ip" "it's at $ip" "server ip: $ip")
+          connect with:
+          ssh -i <path to your private key> $user@$ip
+          (default user is ubuntu on ubuntu images, opc on oracle linux)" \
+              "computer"
           }
 
           # Seconds left in this run's budget
@@ -180,6 +222,12 @@ jobs:
               if grep -qiE "toomanyrequests|too many requests|\"status\": 429" /tmp/list.err; then
                 echo "Throttled on the instance check, cooling down"
                 echo "throttled=yes" >> "$GITHUB_OUTPUT"
+                notify default \
+                  "$(pick "oracle throttled us" "slow-down from oracle" "rate limited" "oracle says chill")" \
+                  "$(pick \
+                    "oracle told us to slow down (on the instance check). cooling off ${BACKOFF_START}s, nothing for you to do." \
+                    "throttled on the hourly check. waiting ${BACKOFF_START}s, script's handling it.")" \
+                  "warning"
                 nap "$BACKOFF_START"
               fi
               exit 0
@@ -217,6 +265,7 @@ jobs:
               --no-retry 2>&1); then
               echo "Launched!"
               inst_json=$(echo "$out" | sed -n '/^{/,$p')
+              inst_id=$(echo "$inst_json" | jq -r '.data.id // empty' 2>/dev/null || true)
               inst_name=$(echo "$inst_json" | jq -r '.data."display-name" // "free-arm"' 2>/dev/null || echo free-arm)
               inst_state=$(echo "$inst_json" | jq -r '.data."lifecycle-state" // "PROVISIONING"' 2>/dev/null || echo PROVISIONING)
               notify urgent "$(pick "WE GOT ONE" "server launched!!" "it landed" "FINALLY")" \
@@ -224,9 +273,10 @@ jobs:
                   "GOT IT bro!! oracle finally caved." \
                   "we caught one!! lets gooo." \
                   "it landed!! the server's real." \
-                  "FINALLY. oracle gave us a server.") $inst_name is $inst_state right now. $(hunt_summary) check compute > instances for the ip in a minute. workflow's off so it won't grab a second one." \
+                  "FINALLY. oracle gave us a server.") $inst_name is $inst_state right now. $(hunt_summary) grabbing the ip next, give it a min. workflow's off so it won't grab a second one." \
                 "tada,rocket"
               stop_workflow
+              if [ -n "$inst_id" ]; then report_ip "$inst_id"; fi
               exit 0
             fi
 
@@ -242,6 +292,15 @@ jobs:
               throttled)
                 throttled=$((throttled + 1))
                 echo "Oracle asked us to slow down. Backing off ${backoff}s, then trying again."
+                if [ "$throttled" -eq 1 ]; then
+                  notify default \
+                    "$(pick "oracle throttled us" "slow-down from oracle" "rate limited" "oracle says chill")" \
+                    "$(pick \
+                      "oracle told us to slow down. backing off ${backoff}s by itself, nothing for you to do." \
+                      "got the too-many-requests answer. waiting ${backoff}s then trying again on its own." \
+                      "throttled by oracle. cooling off ${backoff}s, script's handling it.")" \
+                    "warning"
+                fi
                 nap "$backoff"
                 backoff=$(( backoff * 2 ))
                 [ "$backoff" -gt "$BACKOFF_MAX" ] && backoff=$BACKOFF_MAX
@@ -260,19 +319,15 @@ jobs:
             esac
           done
 
-          # Remember (for the next runs) whether this one was throttled, and send the streak heads-up if due
+          # Remember (for the heartbeat's throttle rate) that this run was throttled
           if [ "$throttled" -gt 0 ]; then
             echo "throttled=yes" >> "$GITHUB_OUTPUT"
-            streak_check yes
             echo "Finished a throttled run, final cooldown"
             nap "$BACKOFF_START"
-          else
-            streak_check no
           fi
 
           echo "No server this run (no capacity: $no_cap, throttled: $throttled), will retry next ping"
           if [ "$heartbeat" = true ]; then
-            days_left=$(( ( $(date -u -d "$DEADLINE" +%s) - $(date -u +%s) ) / 86400 ))
             notify low \
               "$(pick "still hunting" "server hunt" "nothing yet" "oracle watch" "still nothing")" \
               "$(pick \
@@ -283,15 +338,14 @@ jobs:
                 "capacity: zero. persistence: maximum." \
                 "still waiting on a free slot, nothing for you to do bro." \
                 "no server yet but the script ain't giving up." \
-                "another day, another empty datacenter. still at it.") last run: $no_cap no-capacity, $throttled throttled. $(hunt_summary) $days_left days left till the deadline." \
+                "another day, another empty datacenter. still at it.") $(window_summary) $(hunt_summary) $(manga_rec)" \
               "hourglass_flowing_sand"
           elif [ "$MILESTONE_RUNS" -gt 0 ] && [ $(( GITHUB_RUN_NUMBER % MILESTONE_RUNS )) -eq 0 ]; then
-            days_left=$(( ( $(date -u -d "$DEADLINE" +%s) - $(date -u +%s) ) / 86400 ))
             notify low "run #$GITHUB_RUN_NUMBER" \
               "$(pick \
                 "hit run #$GITHUB_RUN_NUMBER and still no server lol." \
                 "run #$GITHUB_RUN_NUMBER done. oracle's still being stingy." \
-                "milestone: run #$GITHUB_RUN_NUMBER. no server yet but we're not stopping.") $(hunt_summary) $days_left days left till the deadline." \
+                "milestone: run #$GITHUB_RUN_NUMBER. no server yet but we're not stopping.") $(hunt_summary) $(manga_rec)" \
               "chart_with_upwards_trend"
           fi
 
